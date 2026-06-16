@@ -1,7 +1,7 @@
 NCCL_BUILD ?= /root/nccl-2.30.7-1/build
 NVCC ?= nvcc
 
-TARGET := mixed_segment_gin_demo
+TARGETS := mixed_segment_gin_demo host_only_gin_demo
 
 # Include Hopper (sm_90, e.g. H20/H100) and Blackwell (sm_100, e.g. B200).
 # Override if needed, for example:
@@ -15,15 +15,18 @@ INCLUDES := -I$(NCCL_BUILD)/include
 LIBS := -L$(NCCL_BUILD)/lib -Xlinker -rpath -Xlinker $(NCCL_BUILD)/lib \
         -lnccl -lcuda -lcudart -lpthread -lnuma
 
-.PHONY: all run clean
+.PHONY: all run run-host clean
 
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(TARGET).cu
+%: %.cu
 	$(NVCC) $(NVCCFLAGS) $(NVCC_GENCODE) $(INCLUDES) $< -o $@ $(LIBS)
 
-run: $(TARGET)
-	NCCL_DEBUG=INFO NCCL_ELASTIC_BUFFER_REGISTER=1 ./$(TARGET)
+run: mixed_segment_gin_demo
+	NCCL_DEBUG=INFO NCCL_ELASTIC_BUFFER_REGISTER=1 ./mixed_segment_gin_demo
+
+run-host: host_only_gin_demo
+	NCCL_DEBUG=INFO NCCL_ELASTIC_BUFFER_REGISTER=1 ./host_only_gin_demo
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)

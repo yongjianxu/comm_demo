@@ -1,16 +1,33 @@
-# Mixed-Segment Elastic GIN Demo (NCCL 2.30.7)
+# Elastic-Buffer Device-API GIN Demos (NCCL 2.30.7)
 
-A self-contained, single-process, multi-GPU program that builds NCCL symmetric
-windows whose virtual address is stitched from **two physical segments — GPU
-device memory + host-NUMA memory** — and runs a GPU-initiated (GIN) all-to-all
-across them.
+Self-contained, single-process, multi-GPU programs that build NCCL symmetric
+windows whose virtual address is stitched from **multiple physical CUDA VMM
+segments**, then run a GPU-initiated (GIN) all-to-all across them.
 
-It demonstrates the NCCL 2.30.7 elastic-buffer feature
+They demonstrate the NCCL 2.30.7 elastic-buffer feature
 (`NCCL_ELASTIC_BUFFER_REGISTER`): user-controlled per-segment placement, the
 multi-segment registration path, and how one verifies where data physically
 lives.
 
-Source: [`mixed_segment_gin_demo.cu`](mixed_segment_gin_demo.cu)
+## Variants
+
+| Source | Window layout | Segment tag | Notes |
+|---|---|---|---|
+| [`mixed_segment_gin_demo.cu`](mixed_segment_gin_demo.cu) | seg0 = **DEVICE**, seg1 = **HOST_NUMA** | `ncclGin_SegmentMixed` | Device + host in one VA; placement is the point. |
+| [`host_only_gin_demo.cu`](host_only_gin_demo.cu) | seg0 = **HOST_NUMA**, seg1 = **HOST_NUMA** | `ncclGin_SegmentHostNuma` | No device pages at all — still multi-segment and still gated by the feature. |
+
+Both are multi-segment (`numSegments == 2`) and require
+`NCCL_ELASTIC_BUFFER_REGISTER=1` because they contain host-backed segments. The
+host-only variant is simpler in one way — the whole VA is CPU-addressable, so
+init/verify are plain `memcpy` (no device/host copy split). The rest of this
+document describes the **mixed** demo in detail; the host-only variant differs
+only in `allocHostOnly` (both segments `HOST_NUMA`, single whole-range
+`cuMemSetAccess`) and the kernel's `ncclGin_SegmentHostNuma` tag.
+
+> Note: a **device-only** window (all segments `CU_MEM_LOCATION_TYPE_DEVICE`)
+> would take the plain GIN fast path and is *not* an elastic buffer — the
+> feature is specifically about host pages being present. "Host-only" is in
+> scope; "device-only" is not.
 
 ---
 
@@ -196,6 +213,33 @@ Note `peer 0` lands in the DEVICE segment and `peer 1` in the HOST_NUMA segment
 (offset `0x400000` == `seg0Size`), each driver-confirmed — the all-to-all then
 crosses that boundary and verifies. To also see NCCL's 2-segment registration
 and the chosen GIN NIC, run `make run` (adds `NCCL_DEBUG=INFO`).
+
+### Example run — host-only variant
+
+Test command:
+
+```sh
+NCCL_ELASTIC_BUFFER_REGISTER=1 ./host_only_gin_demo    # or: make run-host
+```
+
+Output (on 2× NVIDIA H20, same NUMA node; `NCCL version` line elided):
+
+```text
+GPU 0 affinity: host-NUMA node 0, running on CPU 137 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 0 host-only buffer 0xa04000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 0 host-only buffer 0xa04800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 0 send-buffer per-peer chunk placement (boundary seg0Size=4194304):
+  peer 0 @ off 0x0: expected segment 0 (HOST_NUMA), driver reports HOST_NUMA(id 0) OK
+  peer 1 @ off 0x400000: expected segment 1 (HOST_NUMA), driver reports HOST_NUMA(id 0) OK
+GPU 1 affinity: host-NUMA node 0, running on CPU 137 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 1 host-only buffer 0xa05000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 1 host-only buffer 0xa05800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+host-only GIN all-to-all: PASSED
+```
+
+Both per-peer chunks are host-backed, in different segments (`peer 0` → seg0,
+`peer 1` → seg1), driver-confirmed — the GIN all-to-all crosses the
+host↔host segment boundary and verifies.
 
 ---
 
