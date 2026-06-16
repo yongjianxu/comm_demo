@@ -1,31 +1,35 @@
-# Elastic-Buffer Device-API GIN Demos (NCCL 2.30.7)
+# Elastic-Buffer Device-API Demos (NCCL 2.30.7)
 
 Self-contained, single-process, multi-GPU programs that build NCCL symmetric
 windows whose virtual address is stitched from **multiple physical CUDA VMM
-segments**, then run a GPU-initiated (GIN) all-to-all across them.
+segments** (device and/or host-NUMA), then move data across them with the NCCL
+device API.
 
 They demonstrate the NCCL 2.30.7 elastic-buffer feature
 (`NCCL_ELASTIC_BUFFER_REGISTER`): user-controlled per-segment placement, the
 multi-segment registration path, and how one verifies where data physically
-lives.
+lives — over **both** transport paths: GIN (GPU-initiated networking, NIC) and
+LSA (direct peer load/store over NVLink / C2C).
 
 ## Variants
 
-| Source | Window layout | Segment tag | Notes |
+| Source | Transport | Window layout | Notes |
 |---|---|---|---|
-| [`mixed_segment_gin_demo.cu`](mixed_segment_gin_demo.cu) | seg0 = **DEVICE**, seg1 = **HOST_NUMA** | `ncclGin_SegmentMixed` | Device + host in one VA; placement is the point. |
-| [`host_only_gin_demo.cu`](host_only_gin_demo.cu) | seg0 = **HOST_NUMA node 0**, seg1 = **HOST_NUMA node 1** | `ncclGin_SegmentHostNuma` | No device pages at all; the two segments live on **different host NUMA nodes** (falls back to one node on a single-node box). Still multi-segment and still gated by the feature. |
+| [`mixed_segment_gin_demo.cu`](mixed_segment_gin_demo.cu) | **GIN** (`gin.put`, NIC) | seg0 = **DEVICE**, seg1 = **HOST_NUMA** | Device + host in one VA; placement is the point. Kernel tag `ncclGin_SegmentMixed`. |
+| [`host_only_gin_demo.cu`](host_only_gin_demo.cu) | **GIN** (`gin.put`, NIC) | seg0 = **HOST_NUMA node 0**, seg1 = **HOST_NUMA node 1** | No device pages; the two segments live on **different host NUMA nodes** (falls back to one node on a single-node box). Kernel tag `ncclGin_SegmentHostNuma`. |
+| [`lsa_segment_demo.cu`](lsa_segment_demo.cu) | **LSA** (`ncclGetLsaPointer`, NVLink/C2C) | `--mixed`: seg0=DEVICE, seg1=HOST_NUMA; default: both HOST_NUMA | Peer GPUs **directly load/store** into each other's window — including the **host segments** — over NVLink. Proves host pages are LSA-accessible, not just NIC-reachable. |
 
-Both are multi-segment (`numSegments == 2`) and require
+All are multi-segment (`numSegments == 2`) and require
 `NCCL_ELASTIC_BUFFER_REGISTER=1` because they contain host-backed segments. The
-host-only variant is simpler in one way — the whole VA is CPU-addressable, so
-init/verify are plain `memcpy` (no device/host copy split) — and it shows that
-the two host segments may even sit on **different NUMA nodes** (only
-`location.type` is constrained, not `location.id`). The rest of this document
-describes the **mixed** demo in detail; the host-only variant differs only in
-`allocHostOnly` (both segments `HOST_NUMA`, one per NUMA node, whole-range
-`cuMemSetAccess` granting the GPU + both nodes) and the kernel's
-`ncclGin_SegmentHostNuma` tag.
+host-only GIN variant is simpler in one way — the whole VA is CPU-addressable,
+so init/verify are plain `memcpy` (no device/host copy split) — and it shows
+that the two host segments may even sit on **different NUMA nodes** (only
+`location.type` is constrained, not `location.id`).
+
+The rest of this document describes the **mixed GIN** demo in detail. The
+host-only GIN variant differs only in `allocHostOnly` (both segments
+`HOST_NUMA`, one per NUMA node) and the `ncclGin_SegmentHostNuma` tag. The
+**LSA** demo is described in its own section below.
 
 > Note: a **device-only** window (all segments `CU_MEM_LOCATION_TYPE_DEVICE`)
 > would take the plain GIN fast path and is *not* an elastic buffer — the
@@ -247,6 +251,69 @@ segment boundary and verifies. seg1 is remote to the GPU and its NIC, so this
 layout is a **capacity** play (span both nodes' memory), not a bandwidth one;
 the per-segment placement is what makes that tradeoff explicit. On a single-NUMA
 box both segments fall back to node 0.
+
+---
+
+## LSA demo — direct peer load/store over NVLink (`lsa_segment_demo.cu`)
+
+The GIN demos move data with `gin.put` over the NIC. The **LSA** demo instead
+has each GPU **directly load/store into a peer GPU's window memory** over
+NVLink / C2C, using `ncclGetLsaPointer(window, offset, peer)`. This proves that
+an elastic buffer's **host-NUMA segments are reachable by peer GPUs over
+NVLink**, not only over the NIC.
+
+It runs an all-gather: each rank writes its contribution into every peer's recv
+window at `slot[rank]` via a peer LSA pointer; an `ncclLsaBarrierSession`
+orders the writes; then every recv buffer holds all ranks' data, verified on the
+host.
+
+Two layouts via a flag:
+
+```sh
+make run-lsa            # host-only: seg0 = HOST_NUMA, seg1 = HOST_NUMA
+make run-lsa-mixed      # mixed:     seg0 = DEVICE,    seg1 = HOST_NUMA
+# or directly:
+./lsa_segment_demo [--mixed] [num_devices] [elems_per_rank]
+```
+
+Key differences from the GIN demos:
+- **Setup:** no GIN connections — `ncclDevCommCreate` just needs
+  `reqs.lsaBarrierCount`. (Still create all ranks' devcomms in one
+  `ncclGroupStart/End`: LSA establishes peer/NVLink connections, a rendezvous.)
+- **Kernel:** `ncclGetLsaPointer` returns a raw `void*` into peer memory; the
+  GPU dereferences it directly (a real NVLink/C2C load-store), ordered by an
+  `ncclLsaBarrierSession` over `ncclTeamTagLsa()`.
+- **Requirement:** peers must share an NVLink/P2P (LSA) domain — i.e.
+  `cudaDeviceCanAccessPeer` between the GPUs. On a single NVLink node all ranks
+  form one LSA team.
+
+Example output (host-only, 2× H20, `NCCL version` line elided):
+
+```text
+LSA host-only demo: 2 GPUs, 1048576 elems/rank
+GPU 0 affinity: host-NUMA node 0, CPU 0
+GPU 0 host-only buffer 0xa04000000: seg0=HOST_NUMA 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608
+GPU 0 recv-buffer slot placement (boundary seg0Size=4194304):
+  slot 0 @ off 0x0 (seg 0): expected HOST_NUMA, driver reports HOST_NUMA(id 0) OK
+  slot 1 @ off 0x400000 (seg 1): expected HOST_NUMA, driver reports HOST_NUMA(id 0) OK
+LSA host-only all-gather: PASSED
+```
+
+And the mixed layout — peers write `slot 0` into a **DEVICE** segment and
+`slot 1` into a **HOST_NUMA** segment, both over NVLink:
+
+```text
+GPU 0 mixed buffer 0xa04000000: seg0=DEVICE 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608
+GPU 0 recv-buffer slot placement (boundary seg0Size=4194304):
+  slot 0 @ off 0x0 (seg 0): expected DEVICE, driver reports DEVICE(id 0) OK
+  slot 1 @ off 0x400000 (seg 1): expected HOST_NUMA, driver reports HOST_NUMA(id 0) OK
+LSA mixed-segment all-gather: PASSED
+```
+
+> A host (HOST_NUMA) segment is mapped into the LSA peer window, so peer GPUs
+> reach it by direct load/store over NVLink/C2C. The one thing host segments
+> lose is **NVLink multicast (NVLS)**: NCCL skips `cuMulticastBindAddr` for any
+> window containing a CPU-backed segment, so multimem is device-only.
 
 ---
 
