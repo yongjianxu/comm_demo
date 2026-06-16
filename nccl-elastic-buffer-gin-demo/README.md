@@ -169,6 +169,34 @@ host-NUMA VMM support (CUDA ≥ 12.x) and an NCCL build with Device API + GIN.
   `numGinSegments > 1` path ran).
 - Final line: `mixed-segment GIN all-to-all: PASSED`.
 
+### Example run
+
+Test command (2× GPU, default size):
+
+```sh
+NCCL_ELASTIC_BUFFER_REGISTER=1 ./mixed_segment_gin_demo
+```
+
+Output (on 2× NVIDIA H20, same NUMA node; `NCCL version` line elided):
+
+```text
+GPU 0 affinity: host-NUMA node 0, running on CPU 96 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 0 mixed buffer 0xa04000000: seg0=DEVICE 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 0 mixed buffer 0xa04800000: seg0=DEVICE 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 0 send-buffer per-peer chunk placement (boundary seg0Size=4194304):
+  peer 0 @ off 0x0: expected DEVICE, driver reports DEVICE(id 0) OK
+  peer 1 @ off 0x400000: expected HOST_NUMA, driver reports HOST_NUMA(id 0) OK
+GPU 1 affinity: host-NUMA node 0, running on CPU 96 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 1 mixed buffer 0xa05000000: seg0=DEVICE 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 1 mixed buffer 0xa05800000: seg0=DEVICE 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+mixed-segment GIN all-to-all: PASSED
+```
+
+Note `peer 0` lands in the DEVICE segment and `peer 1` in the HOST_NUMA segment
+(offset `0x400000` == `seg0Size`), each driver-confirmed — the all-to-all then
+crosses that boundary and verifies. To also see NCCL's 2-segment registration
+and the chosen GIN NIC, run `make run` (adds `NCCL_DEBUG=INFO`).
+
 ---
 
 ## Gotchas (learned by running it)
