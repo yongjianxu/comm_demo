@@ -14,15 +14,18 @@ lives.
 | Source | Window layout | Segment tag | Notes |
 |---|---|---|---|
 | [`mixed_segment_gin_demo.cu`](mixed_segment_gin_demo.cu) | seg0 = **DEVICE**, seg1 = **HOST_NUMA** | `ncclGin_SegmentMixed` | Device + host in one VA; placement is the point. |
-| [`host_only_gin_demo.cu`](host_only_gin_demo.cu) | seg0 = **HOST_NUMA**, seg1 = **HOST_NUMA** | `ncclGin_SegmentHostNuma` | No device pages at all — still multi-segment and still gated by the feature. |
+| [`host_only_gin_demo.cu`](host_only_gin_demo.cu) | seg0 = **HOST_NUMA node 0**, seg1 = **HOST_NUMA node 1** | `ncclGin_SegmentHostNuma` | No device pages at all; the two segments live on **different host NUMA nodes** (falls back to one node on a single-node box). Still multi-segment and still gated by the feature. |
 
 Both are multi-segment (`numSegments == 2`) and require
 `NCCL_ELASTIC_BUFFER_REGISTER=1` because they contain host-backed segments. The
 host-only variant is simpler in one way — the whole VA is CPU-addressable, so
-init/verify are plain `memcpy` (no device/host copy split). The rest of this
-document describes the **mixed** demo in detail; the host-only variant differs
-only in `allocHostOnly` (both segments `HOST_NUMA`, single whole-range
-`cuMemSetAccess`) and the kernel's `ncclGin_SegmentHostNuma` tag.
+init/verify are plain `memcpy` (no device/host copy split) — and it shows that
+the two host segments may even sit on **different NUMA nodes** (only
+`location.type` is constrained, not `location.id`). The rest of this document
+describes the **mixed** demo in detail; the host-only variant differs only in
+`allocHostOnly` (both segments `HOST_NUMA`, one per NUMA node, whole-range
+`cuMemSetAccess` granting the GPU + both nodes) and the kernel's
+`ncclGin_SegmentHostNuma` tag.
 
 > Note: a **device-only** window (all segments `CU_MEM_LOCATION_TYPE_DEVICE`)
 > would take the plain GIN fast path and is *not* an elastic buffer — the
@@ -222,24 +225,28 @@ Test command:
 NCCL_ELASTIC_BUFFER_REGISTER=1 ./host_only_gin_demo    # or: make run-host
 ```
 
-Output (on 2× NVIDIA H20, same NUMA node; `NCCL version` line elided):
+Output (on 2× NVIDIA H20, 2-NUMA-node box; `NCCL version` line elided):
 
 ```text
-GPU 0 affinity: host-NUMA node 0, running on CPU 137 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
-GPU 0 host-only buffer 0xa04000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
-GPU 0 host-only buffer 0xa04800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+Segment NUMA nodes: seg0 -> node 0, seg1 -> node 1 (seg1 is cross-node)
+GPU 0 affinity: host-NUMA node 0, running on CPU 97 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 0 host-only buffer 0xa04000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 1) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 0 host-only buffer 0xa04800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 1) 4194304 bytes | total=8388608 (useful=8388608)
 GPU 0 send-buffer per-peer chunk placement (boundary seg0Size=4194304):
-  peer 0 @ off 0x0: expected segment 0 (HOST_NUMA), driver reports HOST_NUMA(id 0) OK
-  peer 1 @ off 0x400000: expected segment 1 (HOST_NUMA), driver reports HOST_NUMA(id 0) OK
-GPU 1 affinity: host-NUMA node 0, running on CPU 137 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
-GPU 1 host-only buffer 0xa05000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
-GPU 1 host-only buffer 0xa05800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 0) 4194304 bytes | total=8388608 (useful=8388608)
+  peer 0 @ off 0x0: expected segment 0 HOST_NUMA(node 0), driver reports HOST_NUMA(id 0) OK
+  peer 1 @ off 0x400000: expected segment 1 HOST_NUMA(node 1), driver reports HOST_NUMA(id 1) OK
+GPU 1 affinity: host-NUMA node 0, running on CPU 97 (GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)
+GPU 1 host-only buffer 0xa05000000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 1) 4194304 bytes | total=8388608 (useful=8388608)
+GPU 1 host-only buffer 0xa05800000: seg0=HOST_NUMA(node 0) 4194304 bytes | seg1=HOST_NUMA(node 1) 4194304 bytes | total=8388608 (useful=8388608)
 host-only GIN all-to-all: PASSED
 ```
 
-Both per-peer chunks are host-backed, in different segments (`peer 0` → seg0,
-`peer 1` → seg1), driver-confirmed — the GIN all-to-all crosses the
-host↔host segment boundary and verifies.
+The two segments live on **different host NUMA nodes** (seg0 → node 0, seg1 →
+node 1), each driver-confirmed — the GIN all-to-all crosses the cross-NUMA
+segment boundary and verifies. seg1 is remote to the GPU and its NIC, so this
+layout is a **capacity** play (span both nodes' memory), not a bandwidth one;
+the per-segment placement is what makes that tradeoff explicit. On a single-NUMA
+box both segments fall back to node 0.
 
 ---
 

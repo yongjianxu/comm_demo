@@ -73,14 +73,16 @@
 static constexpr int kCtas = 16;
 static constexpr int kThreads = 256;
 
-// A window VA built from two HOST_NUMA segments mapped back-to-back.
+// A window VA built from two HOST_NUMA segments mapped back-to-back, each on a
+// (potentially) different host NUMA node.
 struct HostBuffer {
   void* va = nullptr;     // base of the contiguous VA spanning both segments
   size_t total = 0;       // seg0Size + seg1Size (granularity-padded)
   size_t seg0Size = 0;    // bytes of the first segment == the segment boundary
   CUmemGenericAllocationHandle h0 = 0;
   CUmemGenericAllocationHandle h1 = 0;
-  int numaNode = 0;
+  int numaNode0 = 0;      // NUMA node backing segment 0
+  int numaNode1 = 0;      // NUMA node backing segment 1
 };
 
 static size_t alignUp(size_t value, size_t alignment) {
@@ -114,27 +116,30 @@ static int bindToDeviceNuma(int cudaDev) {
   return numaNode;
 }
 
-// Allocate one contiguous VA backed by [HOST_NUMA segment | HOST_NUMA segment].
-static HostBuffer allocHostOnly(size_t usefulBytes, int cudaDev) {
+// Allocate one contiguous VA backed by [HOST_NUMA(node0) | HOST_NUMA(node1)].
+// The two segments may live on different host NUMA nodes -- still a valid
+// elastic buffer (both are CU_MEM_LOCATION_TYPE_HOST_NUMA; only location.id
+// differs, which NCCL does not constrain).  node1 != node0 means seg1 is
+// remote to the GPU/NIC -- correct but slower -- a capacity, not bandwidth, win.
+static HostBuffer allocHostOnly(size_t usefulBytes, int cudaDev, int node0, int node1) {
   HostBuffer out;
+  out.numaNode0 = node0;
+  out.numaNode1 = node1;
 
-  CUdevice dev;
-  CUDA_DRV_CHECK(cuDeviceGet(&dev, cudaDev));
+  // Per-segment properties, differing only in the host NUMA node id.
+  CUmemAllocationProp prop0 = {};
+  prop0.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop0.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+  prop0.location.id = node0;
+  prop0.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  CUmemAllocationProp prop1 = prop0;
+  prop1.location.id = node1;
 
-  int numaNode = -1;
-  CUDA_DRV_CHECK(cuDeviceGetAttribute(&numaNode, CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID, dev));
-  if (numaNode < 0) numaNode = 0;
-  out.numaNode = numaNode;
-
-  // Both segments are host-backed on the GPU's NUMA node.
-  CUmemAllocationProp hostProp = {};
-  hostProp.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-  hostProp.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-  hostProp.location.id = numaNode;
-  hostProp.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-
-  size_t G = 0;
-  CUDA_DRV_CHECK(cuMemGetAllocationGranularity(&G, &hostProp, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  // Single granularity that satisfies both (host props share granularity).
+  size_t g0 = 0, g1 = 0;
+  CUDA_DRV_CHECK(cuMemGetAllocationGranularity(&g0, &prop0, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  CUDA_DRV_CHECK(cuMemGetAllocationGranularity(&g1, &prop1, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+  const size_t G = g0 > g1 ? g0 : g1;
 
   // 50/50 split, each segment rounded up to granularity.  Both ranks run this
   // identical formula, which is REQUIRED: ncclDevrVerifySegmentLayouts rejects
@@ -144,9 +149,9 @@ static HostBuffer allocHostOnly(size_t usefulBytes, int cudaDev) {
   if (seg1Size == 0) seg1Size = G;  // keep a genuine second segment
   out.total = out.seg0Size + seg1Size;
 
-  // Two physical host handles.
-  CUDA_DRV_CHECK(cuMemCreate(&out.h0, out.seg0Size, &hostProp, 0));
-  CUDA_DRV_CHECK(cuMemCreate(&out.h1, seg1Size, &hostProp, 0));
+  // One physical handle per segment, each on its own NUMA node.
+  CUDA_DRV_CHECK(cuMemCreate(&out.h0, out.seg0Size, &prop0, 0));
+  CUDA_DRV_CHECK(cuMemCreate(&out.h1, seg1Size, &prop1, 0));
 
   // One contiguous VA; map the two handles back-to-back into it.
   CUdeviceptr va = 0;
@@ -154,24 +159,28 @@ static HostBuffer allocHostOnly(size_t usefulBytes, int cudaDev) {
   CUDA_DRV_CHECK(cuMemMap(va, out.seg0Size, 0, out.h0, 0));
   CUDA_DRV_CHECK(cuMemMap(va + out.seg0Size, seg1Size, 0, out.h1, 0));
 
-  // Every segment is host-backed, so a single cuMemSetAccess over the whole
-  // range with both a DEVICE and a HOST_NUMA accessor is valid (the per-segment
-  // split the mixed demo needs is only required when a device segment is
-  // present).  The GPU needs DEVICE access for GIN; the CPU needs HOST_NUMA.
-  CUmemAccessDesc access[2] = {};
+  // Grant access from the GPU (for GIN) and from BOTH host NUMA nodes over the
+  // whole range, so the CPU can reach either segment regardless of node.  All
+  // segments are host-backed, so a single whole-range cuMemSetAccess is valid
+  // (the per-segment split the mixed demo needs is only for device segments).
+  CUmemAccessDesc access[3] = {};
   access[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   access[0].location.id = cudaDev;
   access[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   access[1].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-  access[1].location.id = numaNode;
+  access[1].location.id = node0;
   access[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  CUDA_DRV_CHECK(cuMemSetAccess(va, out.total, access, 2));
+  access[2].location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+  access[2].location.id = node1;
+  access[2].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  int nAccess = (node1 == node0) ? 2 : 3;  // drop the duplicate when nodes match
+  CUDA_DRV_CHECK(cuMemSetAccess(va, out.total, access, nAccess));
 
   out.va = reinterpret_cast<void*>(va);
   std::printf(
     "GPU %d host-only buffer %p: seg0=HOST_NUMA(node %d) %zu bytes | seg1=HOST_NUMA(node %d) %zu bytes | "
     "total=%zu (useful=%zu)\n",
-    cudaDev, out.va, numaNode, out.seg0Size, numaNode, seg1Size, out.total, usefulBytes);
+    cudaDev, out.va, node0, out.seg0Size, node1, seg1Size, out.total, usefulBytes);
   return out;
 }
 
@@ -185,10 +194,11 @@ static void freeHostOnly(HostBuffer* b) {
   *b = HostBuffer{};
 }
 
-// Confirm the driver's ground truth for a VA offset: which segment, and that it
-// is host-backed.  (For a host-only buffer every offset must report HOST_NUMA.)
+// Confirm the driver's ground truth for a VA offset: which segment and which
+// host NUMA node, vs the user's design-time expectation (offset + split).
 static void describeAddress(const HostBuffer& b, size_t off, const char* label) {
   int expectedSeg = off < b.seg0Size ? 0 : 1;
+  int expectedNode = expectedSeg == 0 ? b.numaNode0 : b.numaNode1;
 
   CUmemGenericAllocationHandle h;
   CUmemAllocationProp prop;
@@ -198,9 +208,10 @@ static void describeAddress(const HostBuffer& b, size_t off, const char* label) 
   CUDA_DRV_CHECK(cuMemRelease(h));
 
   bool isHost = prop.location.type == CU_MEM_LOCATION_TYPE_HOST_NUMA;
-  std::printf("  %s @ off 0x%zx: expected segment %d (HOST_NUMA), driver reports %s(id %d) %s\n",
-              label, off, expectedSeg, locTypeName(prop.location.type), prop.location.id,
-              isHost ? "OK" : "MISMATCH!");
+  bool nodeOk = isHost && (int)prop.location.id == expectedNode;
+  std::printf("  %s @ off 0x%zx: expected segment %d HOST_NUMA(node %d), driver reports %s(id %d) %s\n",
+              label, off, expectedSeg, expectedNode, locTypeName(prop.location.type), prop.location.id,
+              nodeOk ? "OK" : "MISMATCH!");
 }
 
 __global__ void hostOnlyGinAllToAllKernel(ncclWindow_t sendWin, ncclWindow_t recvWin,
@@ -299,6 +310,16 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Choose the two host NUMA nodes for the segments.  ALL ranks must use the
+  // SAME pair (ncclDevrVerifySegmentLayouts requires identical layouts), so
+  // these are fixed system-wide, not per-GPU: node 0 and node 1 when the box
+  // has >=2 nodes, else both segments fall back to node 0.
+  int segNode0 = 0;
+  int segNode1 = (numa_available() != -1 && numa_max_node() >= 1) ? 1 : 0;
+  std::printf("Segment NUMA nodes: seg0 -> node %d, seg1 -> node %d%s\n",
+              segNode0, segNode1,
+              segNode1 == segNode0 ? " (single-node fallback)" : " (seg1 is cross-node)");
+
   size_t usefulBytes = ndev * elemsPerPeer * sizeof(int);
   std::vector<HostBuffer> sendBuffers(ndev);
   std::vector<HostBuffer> recvBuffers(ndev);
@@ -315,8 +336,8 @@ int main(int argc, char** argv) {
     std::printf("GPU %d affinity: host-NUMA node %d, running on CPU %d "
                 "(GIN NIC chosen by NCCL topology -- see 'NET/IB ... GID' INFO lines)\n",
                 devices[r], boundNode, cpu);
-    sendBuffers[r] = allocHostOnly(usefulBytes, devices[r]);
-    recvBuffers[r] = allocHostOnly(usefulBytes, devices[r]);
+    sendBuffers[r] = allocHostOnly(usefulBytes, devices[r], segNode0, segNode1);
+    recvBuffers[r] = allocHostOnly(usefulBytes, devices[r], segNode0, segNode1);
 
     // Confirm each per-peer send chunk is host-backed (driver ground truth).
     if (r == 0) {
